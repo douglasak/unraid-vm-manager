@@ -1,0 +1,862 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "vm.manager">
+<!ENTITY author    "douglasak">
+<!ENTITY version   "2026.06.08">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/douglasak/vm-manager/main/vm.manager.plg">
+<!ENTITY support   "https://github.com/douglasak/vm-manager/issues">
+<!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
+]>
+
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        pluginURL="&pluginURL;"
+        support="&support;"
+        launch="Settings/VMManager"
+        icon="desktop"
+        min="6.10.0">
+
+<CHANGES>
+###&version;
+- Add pluginURL (GitHub) for update checks, support URL, and CA metadata.
+
+###2026.06.07
+- On-host VM manager: start / stop / restart / force-restart / force-stop,
+  set RAM, and toggle GPU passthrough, in an auto-refreshing table.
+- GPU passthrough is configured at runtime (auto-detected via lspci) rather
+  than hardcoded, so it works on any host.
+- Running-VM RAM changes report success/failure of the restart.
+- MIT licensed. Provided AS IS, without warranty; use at your own risk.
+</CHANGES>
+
+<!-- clean any prior install, recreate the tree (runs at install AND every boot) -->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf &plugdir;
+mkdir -p &plugdir;/include
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/vm.manager.page" Mode="0644">
+<INLINE>
+<![CDATA[
+Menu="Utilities"
+Title="VM Manager"
+Icon="desktop"
+---
+<?php
+/* vm.manager.page — VM management GUI. */
+require_once '/usr/local/emhttp/plugins/vm.manager/include/vmlib.php';
+$csrf = csrf_token();
+$host = emhttp_var('NAME', 'this server');
+?>
+
+<style>
+  .vmm-wrap        { max-width: 1000px; }
+  .vmm-warn        { margin: 6px 0 14px; padding: 8px 12px; border: 1px solid rgba(217,164,0,.5);
+                     background: rgba(217,164,0,.08); border-radius: 4px; }
+  table.vmm        { width: 100%; border-collapse: collapse; }
+  table.vmm th,
+  table.vmm td     { padding: 6px 8px; text-align: left; vertical-align: middle; white-space: nowrap; }
+  table.vmm th     { border-bottom: 1px solid rgba(128,128,128,.35); font-weight: bold; }
+  table.vmm tr + tr td { border-top: 1px solid rgba(128,128,128,.15); }
+  .vmm-state.running   { color: #1fa31f; font-weight: bold; }
+  .vmm-state.off       { color: #888; }
+  .vmm-state.warn      { color: #d9a400; font-weight: bold; }
+  .vmm-gpu.on          { color: #1fa31f; font-weight: bold; }
+  .vmm-gpu.off         { color: #888; }
+  .vmm button          { margin: 0 2px; padding: 3px 7px; cursor: pointer; }
+  .vmm button:disabled { opacity: .35; cursor: default; }
+  .vmm input.ram       { width: 64px; text-align: right; }
+  #vmm-msg             { margin: 10px 0; min-height: 1.2em; }
+  #vmm-msg.ok          { color: #1fa31f; }
+  #vmm-msg.err         { color: #c0392b; }
+  .vmm-actions         { text-align: right; }
+  .vmm-cfg             { margin-top: 16px; max-width: 780px; }
+  .vmm-cfg summary     { cursor: pointer; font-weight: bold; }
+  .vmm-cfg .row        { margin: .5em 0; }
+  .vmm-cfg input       { width: 70px; }
+</style>
+
+<div class="vmm-wrap">
+  <p>Manage libvirt VMs on <b><?=htmlspecialchars($host)?></b> — start, stop, restart, set RAM, and toggle GPU passthrough. The table auto-refreshes every 5&nbsp;seconds.</p>
+
+  <div class="vmm-warn">
+    This plugin controls VMs directly via <code>virsh</code> — starting, force-stopping, resetting,
+    changing RAM, and attaching/detaching GPUs. Actions take effect immediately and can interrupt
+    running VMs or lead to data loss. <b>Use entirely at your own risk.</b> No warranty; see LICENSE.
+  </div>
+
+  <div id="vmm-msg"></div>
+
+  <table class="vmm" id="vmm-table">
+    <thead>
+      <tr>
+        <th>Name</th><th>State</th><th>RAM</th><th>GPU</th>
+        <th class="vmm-actions">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="vmm-body">
+      <tr><td colspan="5">Loading…</td></tr>
+    </tbody>
+  </table>
+
+  <p style="margin-top:12px">
+    <button type="button" onclick="vmmLoad()"><i class="fa fa-refresh"></i> Refresh</button>
+  </p>
+
+  <details class="vmm-cfg">
+    <summary>GPU passthrough setup</summary>
+    <div style="padding:8px 2px">
+      <p>Select the GPU to pass through. Its VGA function (and audio function, if present) is
+         attached/detached when you toggle GPU on a VM. Only this server's display devices are listed.</p>
+      <div class="row">
+        <label>GPU:
+          <select id="vmm-gpu-host" style="width:auto;min-width:360px"></select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Guest bus: <input id="vmm-guest-bus" placeholder="0x06"></label>
+        <label style="margin-left:10px">Guest slot: <input id="vmm-guest-slot" placeholder="0x00"></label>
+        <span style="opacity:.6;margin-left:8px">— leave both blank to let libvirt auto-assign the guest address</span>
+      </div>
+      <div class="row">
+        <button type="button" id="vmm-gpu-save">Save GPU config</button>
+        <span id="vmm-gpu-current" style="margin-left:12px;opacity:.75"></span>
+      </div>
+    </div>
+  </details>
+</div>
+
+<script>
+(function () {
+  var API  = '/plugins/vm.manager/include/api.php';
+  var CSRF = '<?=$csrf?>' || (typeof csrf_token !== 'undefined' && csrf_token ? csrf_token : '');
+  var editing = false;          // pause auto-refresh while typing in a RAM field
+  var gpuConfigured = false;    // from ?action=list
+
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  function msg(text, kind){
+    var el = document.getElementById('vmm-msg');
+    el.className = kind || '';
+    el.textContent = text || '';
+  }
+
+  function stateClass(s){
+    if (s === 'running') return 'running';
+    if (s === 'paused' || s === 'in shutdown') return 'warn';
+    return 'off';
+  }
+
+  function btn(label, icon, data, opts){
+    opts = opts || {};
+    var attrs = ' data-vm="'+esc(data.vm)+'" data-action="'+esc(data.action)+'"';
+    if (data.mode)    attrs += ' data-mode="'+esc(data.mode)+'"';
+    if (data.confirm) attrs += ' data-confirm="'+esc(data.confirm)+'"';
+    return '<button type="button"'+(opts.disabled ? ' disabled' : '')+attrs+
+           ' title="'+esc(label)+'"><i class="fa '+icon+'"></i></button>';
+  }
+
+  function rowHtml(v){
+    var running = v.state === 'running';
+    var off     = v.state === 'shut off';
+
+    var actions =
+      btn('Start','fa-play',{vm:v.name,action:'start'},{disabled: running}) +
+      btn('Stop (graceful)','fa-power-off',{vm:v.name,action:'stop'},{disabled: !running}) +
+      btn('Restart','fa-refresh',{vm:v.name,action:'restart'},{disabled: !running}) +
+      btn('Force restart (hard reset)','fa-bolt',
+          {vm:v.name,action:'forcerestart',confirm:'Hard-reset "'+v.name+'"? Unsaved guest data may be lost.'},
+          {disabled: !running}) +
+      btn('Force stop (kill)','fa-stop',
+          {vm:v.name,action:'forcestop',confirm:'Force-stop "'+v.name+'"? This is like pulling the plug.'},
+          {disabled: off});
+
+    var ram =
+      '<input class="ram" type="text" value="'+esc(v.ram)+'" data-vm="'+esc(v.name)+'"> '+
+      '<button type="button" class="ram-set" data-vm="'+esc(v.name)+'" data-action="mem" '+
+        'title="Set memory"><i class="fa fa-check"></i></button>';
+
+    var gpuEnabled = off && gpuConfigured;
+    var gpuTitle = !gpuConfigured ? 'Configure a GPU in GPU passthrough setup below'
+                 : (!off ? 'Shut the VM off to change GPU' : 'Toggle GPU passthrough');
+    var gpu =
+      '<button type="button" class="vmm-gpu '+v.gpu+'"'+(gpuEnabled ? '' : ' disabled')+
+        ' data-vm="'+esc(v.name)+'" data-action="gpu" data-mode="toggle"'+
+        ' title="'+esc(gpuTitle)+'">'+
+        ((v.gpu === 'on') ? 'GPU on' : 'GPU off')+'</button>';
+
+    return '<tr>'+
+      '<td><b>'+esc(v.name)+'</b></td>'+
+      '<td><span class="vmm-state '+stateClass(v.state)+'">'+esc(v.state)+'</span></td>'+
+      '<td>'+ram+'</td>'+
+      '<td>'+gpu+'</td>'+
+      '<td class="vmm-actions">'+actions+'</td>'+
+    '</tr>';
+  }
+
+  window.vmmLoad = function(){
+    if (editing) return;
+    $.getJSON(API + '?action=list')
+      .done(function(d){
+        if (!d.ok){ msg(d.message || 'Failed to load.', 'err'); return; }
+        gpuConfigured = !!d.gpu_configured;
+        var html = d.vms.length
+          ? d.vms.map(rowHtml).join('')
+          : '<tr><td colspan="5">No VMs found.</td></tr>';
+        document.getElementById('vmm-body').innerHTML = html;
+      })
+      .fail(function(){ msg('Could not reach the VM API.', 'err'); });
+  };
+
+  function tokenNow(){
+    if (typeof csrf_token !== 'undefined' && csrf_token) return csrf_token;
+    var el = document.querySelector('input[name="csrf_token"]');
+    if (el && el.value) return el.value;
+    var meta = document.querySelector('meta[name="csrf_token"]');
+    if (meta && meta.content) return meta.content;
+    try { if (window.top && window.top.csrf_token) return window.top.csrf_token; } catch(e){}
+    return CSRF || '';
+  }
+
+  // Shared call: fetch a fresh token (jQuery GET — the path this server's proxy
+  // honours), then issue the request as a jQuery GET. cb gets the parsed JSON.
+  function apiCall(params, cb){
+    $.getJSON(API + '?action=token')
+      .done(function(t){
+        var token = (t && t.token) ? t.token : tokenNow();
+        $.ajax({ url: API, type: 'GET', data: $.extend({ csrf_token: token }, params), dataType: 'json', cache: false })
+          .done(function(r){ cb(r || { ok:false, message:'Empty response.' }); })
+          .fail(function(x){ cb({ ok:false, message:(x.responseJSON && x.responseJSON.message) || ('Action failed (HTTP ' + x.status + ').') }); });
+      })
+      .fail(function(x){ cb({ ok:false, message:'Token fetch failed (HTTP ' + x.status + ').' }); });
+  }
+
+  // Poll the async memory-change status (running-VM restart cycle) until done.
+  function pollMem(vm, tries){
+    if (tries > 40) return;     // ~2 min ceiling
+    $.getJSON(API + '?action=memstatus&vm=' + encodeURIComponent(vm))
+      .done(function(d){
+        if (d && d.ok && d.status && d.status.done){
+          msg(d.status.message, d.status.ok ? 'ok' : 'err');
+          vmmLoad();
+        } else {
+          setTimeout(function(){ pollMem(vm, tries + 1); }, 3000);
+        }
+      })
+      .fail(function(){ setTimeout(function(){ pollMem(vm, tries + 1); }, 3000); });
+  }
+
+  function doAction(el, vm, action, extra){
+    el.disabled = true;
+    apiCall($.extend({ action: action, vm: vm }, extra || {}), function(r){
+      msg(r.message, r.ok ? 'ok' : 'err');
+      if (r.ok && r.async) pollMem(vm, 0);   // running-VM RAM change → watch for the outcome
+      setTimeout(vmmLoad, 800);
+    });
+  }
+
+  // --- GPU setup ------------------------------------------------------------
+  function loadGpuCfg(){
+    $.getJSON(API + '?action=gpucfg').done(function(d){
+      if (!d || !d.ok) return;
+      var opts = '<option value="">— none (GPU toggle disabled) —</option>';
+      (d.gpus || []).forEach(function(g){
+        opts += '<option value="' + esc(g.id) + '"' + (g.id === d.cfg.gpu_host ? ' selected' : '') + '>' +
+                esc(g.id) + ' — ' + esc(g.desc) + (g.has_audio ? ' (+audio)' : '') + '</option>';
+      });
+      document.getElementById('vmm-gpu-host').innerHTML = opts;
+      document.getElementById('vmm-guest-bus').value  = d.cfg.guest_bus || '';
+      document.getElementById('vmm-guest-slot').value = d.cfg.guest_slot || '';
+      document.getElementById('vmm-gpu-current').textContent =
+        d.cfg.configured ? ('Current: ' + d.cfg.gpu_host + (d.cfg.has_audio ? ' (VGA + audio)' : ' (VGA only)'))
+                         : 'Not configured — GPU toggle is disabled.';
+    });
+  }
+
+  function saveGpuCfg(){
+    apiCall({
+      action:     'savegpu',
+      gpu_host:   document.getElementById('vmm-gpu-host').value,
+      guest_bus:  document.getElementById('vmm-guest-bus').value.trim(),
+      guest_slot: document.getElementById('vmm-guest-slot').value.trim()
+    }, function(r){
+      msg(r.message, r.ok ? 'ok' : 'err');
+      loadGpuCfg();
+      vmmLoad();
+    });
+  }
+
+  // --- wire up --------------------------------------------------------------
+  $(function(){
+    $('#vmm-body')
+      .on('focus', 'input.ram', function(){ editing = true; })
+      .on('blur',  'input.ram', function(){ editing = false; })
+      .on('click', 'button[data-action]', function(){
+        var b = this, vm = b.dataset.vm, action = b.dataset.action;
+        var c = b.dataset.confirm;
+        if (c && !confirm(c)) return;
+        var extra = {};
+        if (action === 'gpu') extra.mode = b.dataset.mode || 'toggle';
+        if (action === 'mem'){
+          var input = b.parentNode.querySelector('input.ram');
+          var size  = input ? input.value.trim() : '';
+          if (!size){ msg('Enter a size, e.g. 8G.', 'err'); return; }
+          editing = false;
+          extra.size = size;
+        }
+        doAction(b, vm, action, extra);
+      });
+
+    document.getElementById('vmm-gpu-save').addEventListener('click', saveGpuCfg);
+
+    vmmLoad();
+    loadGpuCfg();
+    setInterval(vmmLoad, 5000);
+  });
+})();
+</script>
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/include/vmlib.php" Mode="0644">
+<INLINE>
+<![CDATA[
+<?php
+/**
+ * vmlib.php — core VM-management logic for the vm.manager Unraid plugin.
+ *
+ * Runs on the Unraid host: emhttp/php-fpm are root on the same box as libvirt,
+ * so this calls virsh directly (no SSH). GPU passthrough is configured at runtime
+ * (see GPU config below) rather than hardcoded, so it works on any host.
+ */
+
+const PLUGIN     = 'vm.manager';
+const PLUGIN_DIR = '/usr/local/emhttp/plugins/' . PLUGIN;
+const CFG_DIR    = '/boot/config/plugins/' . PLUGIN;     // flash: survives reboot
+const CFG_FILE   = CFG_DIR . '/' . PLUGIN . '.cfg';
+
+// --- var.ini / CSRF ---------------------------------------------------------
+
+/**
+ * Read Unraid's var.ini robustly. Under php-fpm, open_basedir may block PHP file
+ * functions from /var/local/emhttp; exec() spawns a process not subject to it.
+ */
+function emhttp_var_raw(): string {
+    $ini = @file_get_contents('/var/local/emhttp/var.ini');
+    if ($ini === false || $ini === '') {
+        $out = [];
+        @exec('cat /var/local/emhttp/var.ini 2>/dev/null', $out);
+        $ini = implode("\n", $out);
+    }
+    return (string)$ini;
+}
+
+/** Pull a single key from var.ini (quote-agnostic), avoiding parse_ini_file. */
+function emhttp_var(string $key, string $default = ''): string {
+    $re = '/^' . preg_quote($key, '/') . '="?([^"\r\n]*)"?/m';
+    if (preg_match($re, emhttp_var_raw(), $m)) return $m[1];
+    return $default;
+}
+
+/** Unraid CSRF token. */
+function csrf_token(): string {
+    return emhttp_var('csrf_token');
+}
+
+// --- binaries ---------------------------------------------------------------
+
+function which_bin(array $candidates, string $fallback): string {
+    foreach ($candidates as $c) if (is_executable($c)) return $c;
+    return $fallback;
+}
+function virsh_bin(): string {
+    static $b = null;
+    return $b ??= which_bin(['/usr/sbin/virsh','/usr/bin/virsh','/usr/local/sbin/virsh','/usr/local/bin/virsh'], 'virsh');
+}
+function lspci_bin(): string {
+    static $b = null;
+    return $b ??= which_bin(['/usr/sbin/lspci','/sbin/lspci','/usr/bin/lspci'], 'lspci');
+}
+
+/** Run virsh with each argument escaped. Returns [rc, output-lines]. */
+function virsh(array $args): array {
+    $cmd = escapeshellarg(virsh_bin());
+    foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string)$a);
+    $out = []; $rc = 0;
+    exec($cmd . ' 2>&1', $out, $rc);
+    return [$rc, $out];
+}
+
+// --- VM queries -------------------------------------------------------------
+
+function vm_list_names(): array {
+    [$rc, $out] = virsh(['list', '--all', '--name']);
+    if ($rc !== 0) return [];
+    return array_values(array_filter(array_map('trim', $out), fn($n) => $n !== ''));
+}
+
+/** Only names virsh reports are accepted — guards every action. */
+function vm_valid(string $vm): bool {
+    return in_array($vm, vm_list_names(), true);
+}
+
+function vm_state(string $vm): string {
+    [$rc, $out] = virsh(['domstate', $vm]);
+    return $rc === 0 ? trim(implode('', $out)) : 'unknown';
+}
+
+function vm_dumpxml(string $vm): string {
+    [$rc, $out] = virsh(['dumpxml', '--inactive', $vm]);
+    return $rc === 0 ? implode("\n", $out) : '';
+}
+
+function vm_mem_kib(string $vm): ?int {
+    $xml = vm_dumpxml($vm);
+    if ($xml !== '' && preg_match('#<memory[^>]*>(\d+)</memory>#', $xml, $m)) return (int)$m[1];
+    return null;
+}
+
+/** Is the configured passthrough GPU attached in the persistent config? */
+function vm_gpu_on(string $vm): bool {
+    if (!gpu_configured()) return false;
+    $xml = vm_dumpxml($vm);
+    return $xml !== '' && strpos($xml, gpu_source_match()) !== false;
+}
+
+function kib_to_human(?int $kib): string {
+    if ($kib === null) return '?';
+    if ($kib >= 1048576) {
+        $g = $kib / 1048576;
+        return ($g == (int)$g) ? sprintf('%dG', $g) : sprintf('%.1fG', $g);
+    }
+    return sprintf('%dM', (int)round($kib / 1024));
+}
+
+/** Parse "8G" / "8192M" / "4096" (bare = MB) -> KiB, or null if invalid. */
+function to_kib(string $size): ?int {
+    $s = strtoupper(trim($size));
+    if (!preg_match('/^(\d+)\s*([GMK])?$/', $s, $m)) return null;
+    $n = (int)$m[1];
+    switch ($m[2] ?? '') {
+        case 'G': $kib = $n * 1024 * 1024; break;
+        case 'M': $kib = $n * 1024;        break;
+        case 'K': $kib = $n;               break;
+        default:  $kib = $n * 1024;        break;
+    }
+    if ($kib < 262144 || $kib > 536870912) return null;   // 256 MiB .. 512 GiB
+    return $kib;
+}
+
+function vm_info(string $vm): array {
+    $kib = vm_mem_kib($vm);
+    return [
+        'name'    => $vm,
+        'state'   => vm_state($vm),
+        'mem_kib' => $kib,
+        'ram'     => kib_to_human($kib),
+        'gpu'     => vm_gpu_on($vm) ? 'on' : 'off',
+    ];
+}
+
+function vm_all(): array {
+    return array_map('vm_info', vm_list_names());
+}
+
+// --- GPU configuration ------------------------------------------------------
+// Config (on flash, persists): gpu_host = "DOMAIN:BUS:SLOT" (no function),
+// e.g. "0000:01:00"; guest_bus/guest_slot = optional explicit guest target
+// (blank = let libvirt auto-assign); has_audio = whether a .1 audio function
+// exists for this card.
+
+function cfg_load(): array {
+    $defaults = ['gpu_host' => '', 'guest_bus' => '0x06', 'guest_slot' => '0x00', 'has_audio' => true];
+    $raw = @file_get_contents(CFG_FILE);
+    if ($raw === false || $raw === '') {
+        $o = []; @exec('cat ' . escapeshellarg(CFG_FILE) . ' 2>/dev/null', $o);
+        $raw = implode("\n", $o);
+    }
+    if ($raw !== '') {
+        $j = json_decode($raw, true);
+        if (is_array($j)) return array_merge($defaults, $j);
+    }
+    return $defaults;
+}
+
+/** Save config to flash. Writes via a temp file + cp to dodge open_basedir on /boot. */
+function cfg_save(array $c): bool {
+    $json = json_encode($c, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    $tmp  = tempnam(sys_get_temp_dir(), 'vmmcfg');
+    if ($tmp === false || @file_put_contents($tmp, $json) === false) return false;
+    @exec('mkdir -p ' . escapeshellarg(CFG_DIR) . ' && cp ' . escapeshellarg($tmp) . ' ' . escapeshellarg(CFG_FILE), $o, $rc);
+    @unlink($tmp);
+    return $rc === 0;
+}
+
+function gpu_configured(): bool {
+    return (bool)preg_match('/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}$/i', cfg_load()['gpu_host'] ?? '');
+}
+
+/** [domain, bus, slot] as libvirt 0x-prefixed hex, from "0000:01:00". */
+function gpu_host_parts(): array {
+    [$d, $b, $s] = explode(':', cfg_load()['gpu_host']);
+    return ["0x$d", "0x$b", "0x$s"];
+}
+
+/** Detection string: the VGA function's host source <address> (no type='pci'). */
+function gpu_source_match(): string {
+    [$d, $b, $s] = gpu_host_parts();
+    return "<address domain='$d' bus='$b' slot='$s' function='0x0'/>";
+}
+
+/** Normalise a guest bus/slot field ("6","06","0x6") to "0x06", or '' if blank/invalid. */
+function norm_hex2(string $v): string {
+    $v = trim($v);
+    if ($v === '') return '';
+    if (!preg_match('/^(0x)?([0-9a-f]{1,2})$/i', $v, $m)) return '';
+    return '0x' . strtolower(str_pad($m[2], 2, '0', STR_PAD_LEFT));
+}
+
+/** Guest <address> element for a function, or '' to let libvirt auto-assign. */
+function gpu_guest_address(string $func): string {
+    $c  = cfg_load();
+    $gb = norm_hex2($c['guest_bus'] ?? '');
+    $gs = norm_hex2($c['guest_slot'] ?? '');
+    if ($gb === '' || $gs === '') return '';
+    $mf = ($func === '0x0') ? " multifunction='on'" : '';
+    return "<address type='pci' domain='0x0000' bus='$gb' slot='$gs' function='$func'$mf/>";
+}
+
+function gpu_hostdev_xml(string $func): string {
+    [$d, $b, $s] = gpu_host_parts();
+    $guest = gpu_guest_address($func);
+    return "<hostdev mode='subsystem' type='pci' managed='yes'>\n"
+         . "  <driver name='vfio'/>\n"
+         . "  <source>\n"
+         . "    <address domain='$d' bus='$b' slot='$s' function='$func'/>\n"
+         . "  </source>\n"
+         . ($guest !== '' ? "  $guest\n" : '')
+         . "</hostdev>\n";
+}
+
+/** Enumerate display-class PCI devices (and whether each has a .1 audio sibling). */
+function detect_gpus(): array {
+    $out = []; @exec(escapeshellarg(lspci_bin()) . ' -D -nn 2>/dev/null', $out);
+    $vga = []; $audio = [];
+    foreach ($out as $line) {
+        if (!preg_match('/^([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2})\.([0-9a-f])\s+(.*)$/i', $line, $m)) continue;
+        [$slot, $func, $desc] = [$m[1], strtolower($m[2]), $m[3]];
+        if (preg_match('/\[03[0-9a-f]{2}\]/i', $desc)) {                 // display controller class 03xx
+            $vga[$slot] = trim(preg_replace('/\s*\[[0-9a-f]{4}:[0-9a-f]{4}\].*$/i', '', $desc));
+        } elseif ($func === '1' && preg_match('/\[0403\]/', $desc)) {    // audio device
+            $audio[$slot] = true;
+        }
+    }
+    $gpus = [];
+    foreach ($vga as $slot => $desc) {
+        $gpus[] = ['id' => $slot, 'desc' => $desc, 'has_audio' => isset($audio[$slot])];
+    }
+    return $gpus;
+}
+
+// --- actions ----------------------------------------------------------------
+
+function ok(string $msg, array $extra = []): array  { return ['ok' => true,  'message' => $msg] + $extra; }
+function fail(string $msg, array $extra = []): array { return ['ok' => false, 'message' => $msg] + $extra; }
+
+function act_start(string $vm): array {
+    if (vm_state($vm) === 'running') return ok("'$vm' is already running.");
+    [$rc, $out] = virsh(['start', $vm]);
+    return $rc === 0 ? ok("Started '$vm'.") : fail(trim(implode("\n", $out)));
+}
+function act_stop(string $vm): array {
+    [$rc, $out] = virsh(['shutdown', $vm]);
+    return $rc === 0 ? ok("Shutdown signal sent to '$vm'. (Use Force stop if it doesn't stop.)") : fail(trim(implode("\n", $out)));
+}
+function act_forcestop(string $vm): array {
+    [$rc, $out] = virsh(['destroy', $vm]);
+    return $rc === 0 ? ok("Force-stopped '$vm'.") : fail(trim(implode("\n", $out)));
+}
+function act_restart(string $vm): array {
+    [$rc, $out] = virsh(['reboot', $vm]);
+    return $rc === 0 ? ok("Reboot signal sent to '$vm'.") : fail(trim(implode("\n", $out)));
+}
+function act_forcerestart(string $vm): array {
+    [$rc, $out] = virsh(['reset', $vm]);
+    return $rc === 0 ? ok("Hard-reset '$vm'.") : fail(trim(implode("\n", $out)));
+}
+
+// --- memory (with async status for the running-VM restart cycle) ------------
+
+function mem_status_path(string $vm): string {
+    return sys_get_temp_dir() . '/vm.manager.mem-' . md5($vm);
+}
+
+function mem_status_read(string $vm): ?array {
+    $raw = @file_get_contents(mem_status_path($vm));
+    if ($raw === false || $raw === '') return null;
+    $kv = [];
+    foreach (explode("\n", $raw) as $l) {
+        if ($l === '') continue;
+        [$k, $v] = array_pad(explode('=', $l, 2), 2, '');
+        $kv[$k] = $v;
+    }
+    $okf = $kv['ok'] ?? '';
+    return [
+        'ts'      => (int)($kv['ts'] ?? 0),
+        'done'    => ($okf !== ''),     // empty 'ok' = still in progress
+        'ok'      => ($okf === '1'),
+        'message' => $kv['msg'] ?? '',
+    ];
+}
+
+/**
+ * Set memory (both max and current). libvirt only allows max to change while the
+ * VM is off, so for a running VM we stop → apply → start in the BACKGROUND (the
+ * graceful shutdown can take ~60s) and write the outcome to a status file the UI
+ * polls — so a failed restart surfaces as a real error instead of a silent stop.
+ */
+function act_mem(string $vm, string $size): array {
+    $kib = to_kib($size);
+    if ($kib === null) return fail("Invalid size '$size' (use e.g. 8G, 8192M, 4096; 256M..512G).");
+    $human = kib_to_human($kib);
+
+    if (vm_state($vm) === 'running') {
+        $status = mem_status_path($vm);
+        @file_put_contents($status, "ts=" . time() . "\nok=\nmsg=Applying $human…\n");
+
+        $tpl = <<<'BASH'
+err=""
+%1$s shutdown %2$s 2>/dev/null
+for i in $(seq 1 30); do [ "$(%1$s domstate %2$s 2>/dev/null)" = running ] || break; sleep 2; done
+[ "$(%1$s domstate %2$s 2>/dev/null)" = running ] && %1$s destroy %2$s 2>/dev/null
+e=$(%1$s setmaxmem %2$s %3$d --config 2>&1) || err="setmaxmem: $e"
+[ -z "$err" ] && { e=$(%1$s setmem %2$s %3$d --config 2>&1) || err="setmem: $e"; }
+if [ -z "$err" ]; then
+  if e=$(%1$s start %2$s 2>&1); then
+    printf 'ts=%%s\nok=1\nmsg=%%s\n' "$(date +%%s)" "%4$s applied and VM restarted." > %5$s
+  else
+    printf 'ts=%%s\nok=0\nmsg=%%s\n' "$(date +%%s)" "%4$s applied but VM failed to restart: $(printf %%s "$e" | tr '\n' ' ' | cut -c1-180)" > %5$s
+  fi
+else
+  printf 'ts=%%s\nok=0\nmsg=%%s\n' "$(date +%%s)" "Memory change failed: $(printf %%s "$err" | tr '\n' ' ' | cut -c1-180)" > %5$s
+fi
+BASH;
+        $script = sprintf($tpl, escapeshellarg(virsh_bin()), escapeshellarg($vm), $kib, $human, escapeshellarg($status));
+        exec('nohup bash -c ' . escapeshellarg($script) . ' >/dev/null 2>&1 &');
+        return ok("Restarting '$vm' to apply $human…", ['async' => true]);
+    }
+
+    [$rc1, $o1] = virsh(['setmaxmem', $vm, $kib, '--config']);
+    [$rc2, $o2] = virsh(['setmem',    $vm, $kib, '--config']);
+    if ($rc1 !== 0 || $rc2 !== 0) return fail(trim(implode("\n", array_merge($o1, $o2))));
+    return ok("Memory of '$vm' set to $human.");
+}
+
+// --- GPU passthrough toggle (dynamic fragments from config) -----------------
+
+function act_gpu(string $vm, string $want = 'toggle'): array {
+    if (!gpu_configured()) {
+        return fail('No GPU configured. Open GPU Passthrough settings and select your card first.');
+    }
+    $cur = vm_gpu_on($vm) ? 'on' : 'off';
+
+    if ($want === 'status') return ok("GPU passthrough is $cur for '$vm'.", ['gpu' => $cur]);
+    if ($want === 'toggle') $want = ($cur === 'on') ? 'off' : 'on';
+    if ($want !== 'on' && $want !== 'off') return fail("Bad GPU request '$want'.");
+    if ($want === $cur) return ok("GPU passthrough already $cur for '$vm'.", ['gpu' => $cur]);
+    if (vm_state($vm) !== 'shut off') return fail("'$vm' must be shut off to change GPU passthrough.");
+
+    $hasAudio = (bool)(cfg_load()['has_audio'] ?? false);
+
+    // Write generated fragments to temp files for virsh.
+    $vgaFile = tempnam(sys_get_temp_dir(), 'vmmvga');
+    @file_put_contents($vgaFile, gpu_hostdev_xml('0x0'));
+    $audFile = null;
+    if ($hasAudio) {
+        $audFile = tempnam(sys_get_temp_dir(), 'vmmaud');
+        @file_put_contents($audFile, gpu_hostdev_xml('0x1'));
+    }
+
+    $err = [];
+    if ($want === 'on') {
+        [$r, $o] = virsh(['attach-device', $vm, $vgaFile, '--config']); if ($r !== 0) $err = array_merge($err, $o);
+        if ($hasAudio && !$err) { [$r, $o] = virsh(['attach-device', $vm, $audFile, '--config']); if ($r !== 0) $err = array_merge($err, $o); }
+        $msg = "GPU passthrough enabled for '$vm'. Start it to use the card.";
+    } else {
+        if ($hasAudio) { [$r, $o] = virsh(['detach-device', $vm, $audFile, '--config']); if ($r !== 0) $err = array_merge($err, $o); }
+        [$r, $o] = virsh(['detach-device', $vm, $vgaFile, '--config']); if ($r !== 0) $err = array_merge($err, $o);
+        $msg = "GPU passthrough disabled for '$vm' (VNC only).";
+    }
+
+    @unlink($vgaFile);
+    if ($audFile) @unlink($audFile);
+
+    if ($err) return fail(trim(implode("\n", $err)));
+    return ok($msg, ['gpu' => $want]);
+}
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/include/api.php" Mode="0644">
+<INLINE>
+<![CDATA[
+<?php
+/**
+ * api.php — JSON endpoint for the vm.manager plugin UI.
+ *
+ * Read-only (no CSRF):
+ *   GET ?action=list        -> { vms:[...], gpu_configured:bool }
+ *   GET ?action=token       -> { token }            (live CSRF token)
+ *   GET ?action=memstatus   vm=<name>   -> { status:{ts,done,ok,message}|null }
+ *   GET ?action=gpucfg      -> { cfg:{...}, gpus:[...] }   (config + detected GPUs)
+ *
+ * Mutating (require valid CSRF token; VM name validated against the live list):
+ *   start|stop|forcestop|restart|forcerestart   vm=<name>
+ *   mem    vm=<name> size=<8G|8192M|4096>
+ *   gpu    vm=<name> mode=on|off|toggle|status
+ *   savegpu  gpu_host=<DOMAIN:BUS:SLOT> [guest_bus=..] [guest_slot=..]
+ *
+ * Runs as root under emhttp's php-fpm.
+ */
+
+require_once __DIR__ . '/vmlib.php';
+
+header('Content-Type: application/json');
+
+function out(array $data): void { echo json_encode($data); exit; }
+
+function require_csrf(): void {
+    $real = csrf_token();
+    $got  = (string)($_REQUEST['csrf_token'] ?? '');
+    if ($real === '' || !hash_equals($real, $got)) {
+        http_response_code(403);
+        out(['ok' => false, 'message' => 'Invalid CSRF token.']);
+    }
+}
+
+$action = $_REQUEST['action'] ?? '';
+
+// --- read-only ---------------------------------------------------------------
+if ($action === 'list') {
+    out(['ok' => true, 'vms' => vm_all(), 'gpu_configured' => gpu_configured()]);
+}
+
+// Live CSRF token (the page fetches this via jQuery GET right before each action;
+// same-origin + Unraid login gate it, and delivering it to the page is its point).
+if ($action === 'token') {
+    out(['ok' => true, 'token' => csrf_token()]);
+}
+
+if ($action === 'memstatus') {
+    $vm = trim($_REQUEST['vm'] ?? '');
+    if ($vm === '' || !vm_valid($vm)) out(['ok' => false, 'message' => 'unknown vm']);
+    out(['ok' => true, 'status' => mem_status_read($vm)]);
+}
+
+if ($action === 'gpucfg') {
+    $c = cfg_load();
+    out(['ok' => true, 'cfg' => [
+        'gpu_host'   => $c['gpu_host'],
+        'guest_bus'  => $c['guest_bus'],
+        'guest_slot' => $c['guest_slot'],
+        'has_audio'  => (bool)$c['has_audio'],
+        'configured' => gpu_configured(),
+    ], 'gpus' => detect_gpus()]);
+}
+
+// --- everything below mutates state -----------------------------------------
+require_csrf();
+
+// Save GPU config: validate the chosen device against the live PCI scan.
+if ($action === 'savegpu') {
+    $host = strtolower(trim($_REQUEST['gpu_host'] ?? ''));
+    if ($host === '') {                          // empty = clear configuration
+        cfg_save(array_merge(cfg_load(), ['gpu_host' => '']));
+        out(ok('GPU configuration cleared.'));
+    }
+    $match = null;
+    foreach (detect_gpus() as $g) if (strtolower($g['id']) === $host) { $match = $g; break; }
+    if (!$match) out(fail("'$host' is not a display device on this system."));
+
+    $c = cfg_load();
+    $c['gpu_host']   = $match['id'];
+    $c['has_audio']  = (bool)$match['has_audio'];
+    $c['guest_bus']  = norm_hex2((string)($_REQUEST['guest_bus']  ?? $c['guest_bus']));
+    $c['guest_slot'] = norm_hex2((string)($_REQUEST['guest_slot'] ?? $c['guest_slot']));
+    if (!cfg_save($c)) out(fail('Failed to write config to flash.'));
+    out(ok('GPU configuration saved'
+         . ($match['has_audio'] ? ' (VGA + audio).' : ' (VGA only — no audio function found).')));
+}
+
+$vm = trim($_REQUEST['vm'] ?? '');
+if ($vm === '' || !vm_valid($vm)) {
+    http_response_code(400);
+    out(['ok' => false, 'message' => "Unknown VM: '$vm'."]);
+}
+
+switch ($action) {
+    case 'start':        out(act_start($vm));
+    case 'stop':         out(act_stop($vm));
+    case 'forcestop':    out(act_forcestop($vm));
+    case 'restart':      out(act_restart($vm));
+    case 'forcerestart': out(act_forcerestart($vm));
+    case 'mem':          out(act_mem($vm, trim($_REQUEST['size'] ?? '')));
+    case 'gpu':          out(act_gpu($vm, trim($_REQUEST['mode'] ?? 'toggle')));
+    default:
+        http_response_code(400);
+        out(['ok' => false, 'message' => "Unknown action: '$action'."]);
+}
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/LICENSE" Mode="0644">
+<INLINE>
+<![CDATA[
+MIT License
+
+Copyright (c) 2026 Doug
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+]]>
+</INLINE>
+</FILE>
+<!-- post-install -->
+<FILE Run="/bin/bash">
+<INLINE>
+echo ""
+echo "+=============================================================+"
+echo "| vm.manager installed.                                       |"
+echo "| Open it at:  Settings -> Utilities -> VM Manager            |"
+echo "+=============================================================+"
+echo ""
+</INLINE>
+</FILE>
+
+<!-- uninstall handler -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+rm -rf &plugdir;
+echo "vm.manager removed."
+</INLINE>
+</FILE>
+
+</PLUGIN>

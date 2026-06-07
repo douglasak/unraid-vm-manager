@@ -1,0 +1,278 @@
+Menu="Utilities"
+Title="VM Manager"
+Icon="desktop"
+---
+<?php
+/* vm.manager.page — VM management GUI. */
+require_once '/usr/local/emhttp/plugins/vm.manager/include/vmlib.php';
+$csrf = csrf_token();
+$host = emhttp_var('NAME', 'this server');
+?>
+
+<style>
+  .vmm-wrap        { max-width: 1000px; }
+  .vmm-warn        { margin: 6px 0 14px; padding: 8px 12px; border: 1px solid rgba(217,164,0,.5);
+                     background: rgba(217,164,0,.08); border-radius: 4px; }
+  table.vmm        { width: 100%; border-collapse: collapse; }
+  table.vmm th,
+  table.vmm td     { padding: 6px 8px; text-align: left; vertical-align: middle; white-space: nowrap; }
+  table.vmm th     { border-bottom: 1px solid rgba(128,128,128,.35); font-weight: bold; }
+  table.vmm tr + tr td { border-top: 1px solid rgba(128,128,128,.15); }
+  .vmm-state.running   { color: #1fa31f; font-weight: bold; }
+  .vmm-state.off       { color: #888; }
+  .vmm-state.warn      { color: #d9a400; font-weight: bold; }
+  .vmm-gpu.on          { color: #1fa31f; font-weight: bold; }
+  .vmm-gpu.off         { color: #888; }
+  .vmm button          { margin: 0 2px; padding: 3px 7px; cursor: pointer; }
+  .vmm button:disabled { opacity: .35; cursor: default; }
+  .vmm input.ram       { width: 64px; text-align: right; }
+  #vmm-msg             { margin: 10px 0; min-height: 1.2em; }
+  #vmm-msg.ok          { color: #1fa31f; }
+  #vmm-msg.err         { color: #c0392b; }
+  .vmm-actions         { text-align: right; }
+  .vmm-cfg             { margin-top: 16px; max-width: 780px; }
+  .vmm-cfg summary     { cursor: pointer; font-weight: bold; }
+  .vmm-cfg .row        { margin: .5em 0; }
+  .vmm-cfg input       { width: 70px; }
+</style>
+
+<div class="vmm-wrap">
+  <p>Manage libvirt VMs on <b><?=htmlspecialchars($host)?></b> — start, stop, restart, set RAM, and toggle GPU passthrough. The table auto-refreshes every 5&nbsp;seconds.</p>
+
+  <div class="vmm-warn">
+    This plugin controls VMs directly via <code>virsh</code> — starting, force-stopping, resetting,
+    changing RAM, and attaching/detaching GPUs. Actions take effect immediately and can interrupt
+    running VMs or lead to data loss. <b>Use entirely at your own risk.</b> No warranty; see LICENSE.
+  </div>
+
+  <div id="vmm-msg"></div>
+
+  <table class="vmm" id="vmm-table">
+    <thead>
+      <tr>
+        <th>Name</th><th>State</th><th>RAM</th><th>GPU</th>
+        <th class="vmm-actions">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="vmm-body">
+      <tr><td colspan="5">Loading…</td></tr>
+    </tbody>
+  </table>
+
+  <p style="margin-top:12px">
+    <button type="button" onclick="vmmLoad()"><i class="fa fa-refresh"></i> Refresh</button>
+  </p>
+
+  <details class="vmm-cfg">
+    <summary>GPU passthrough setup</summary>
+    <div style="padding:8px 2px">
+      <p>Select the GPU to pass through. Its VGA function (and audio function, if present) is
+         attached/detached when you toggle GPU on a VM. Only this server's display devices are listed.</p>
+      <div class="row">
+        <label>GPU:
+          <select id="vmm-gpu-host" style="width:auto;min-width:360px"></select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Guest bus: <input id="vmm-guest-bus" placeholder="0x06"></label>
+        <label style="margin-left:10px">Guest slot: <input id="vmm-guest-slot" placeholder="0x00"></label>
+        <span style="opacity:.6;margin-left:8px">— leave both blank to let libvirt auto-assign the guest address</span>
+      </div>
+      <div class="row">
+        <button type="button" id="vmm-gpu-save">Save GPU config</button>
+        <span id="vmm-gpu-current" style="margin-left:12px;opacity:.75"></span>
+      </div>
+    </div>
+  </details>
+</div>
+
+<script>
+(function () {
+  var API  = '/plugins/vm.manager/include/api.php';
+  var CSRF = '<?=$csrf?>' || (typeof csrf_token !== 'undefined' && csrf_token ? csrf_token : '');
+  var editing = false;          // pause auto-refresh while typing in a RAM field
+  var gpuConfigured = false;    // from ?action=list
+
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  function msg(text, kind){
+    var el = document.getElementById('vmm-msg');
+    el.className = kind || '';
+    el.textContent = text || '';
+  }
+
+  function stateClass(s){
+    if (s === 'running') return 'running';
+    if (s === 'paused' || s === 'in shutdown') return 'warn';
+    return 'off';
+  }
+
+  function btn(label, icon, data, opts){
+    opts = opts || {};
+    var attrs = ' data-vm="'+esc(data.vm)+'" data-action="'+esc(data.action)+'"';
+    if (data.mode)    attrs += ' data-mode="'+esc(data.mode)+'"';
+    if (data.confirm) attrs += ' data-confirm="'+esc(data.confirm)+'"';
+    return '<button type="button"'+(opts.disabled ? ' disabled' : '')+attrs+
+           ' title="'+esc(label)+'"><i class="fa '+icon+'"></i></button>';
+  }
+
+  function rowHtml(v){
+    var running = v.state === 'running';
+    var off     = v.state === 'shut off';
+
+    var actions =
+      btn('Start','fa-play',{vm:v.name,action:'start'},{disabled: running}) +
+      btn('Stop (graceful)','fa-power-off',{vm:v.name,action:'stop'},{disabled: !running}) +
+      btn('Restart','fa-refresh',{vm:v.name,action:'restart'},{disabled: !running}) +
+      btn('Force restart (hard reset)','fa-bolt',
+          {vm:v.name,action:'forcerestart',confirm:'Hard-reset "'+v.name+'"? Unsaved guest data may be lost.'},
+          {disabled: !running}) +
+      btn('Force stop (kill)','fa-stop',
+          {vm:v.name,action:'forcestop',confirm:'Force-stop "'+v.name+'"? This is like pulling the plug.'},
+          {disabled: off});
+
+    var ram =
+      '<input class="ram" type="text" value="'+esc(v.ram)+'" data-vm="'+esc(v.name)+'"> '+
+      '<button type="button" class="ram-set" data-vm="'+esc(v.name)+'" data-action="mem" '+
+        'title="Set memory"><i class="fa fa-check"></i></button>';
+
+    var gpuEnabled = off && gpuConfigured;
+    var gpuTitle = !gpuConfigured ? 'Configure a GPU in GPU passthrough setup below'
+                 : (!off ? 'Shut the VM off to change GPU' : 'Toggle GPU passthrough');
+    var gpu =
+      '<button type="button" class="vmm-gpu '+v.gpu+'"'+(gpuEnabled ? '' : ' disabled')+
+        ' data-vm="'+esc(v.name)+'" data-action="gpu" data-mode="toggle"'+
+        ' title="'+esc(gpuTitle)+'">'+
+        ((v.gpu === 'on') ? 'GPU on' : 'GPU off')+'</button>';
+
+    return '<tr>'+
+      '<td><b>'+esc(v.name)+'</b></td>'+
+      '<td><span class="vmm-state '+stateClass(v.state)+'">'+esc(v.state)+'</span></td>'+
+      '<td>'+ram+'</td>'+
+      '<td>'+gpu+'</td>'+
+      '<td class="vmm-actions">'+actions+'</td>'+
+    '</tr>';
+  }
+
+  window.vmmLoad = function(){
+    if (editing) return;
+    $.getJSON(API + '?action=list')
+      .done(function(d){
+        if (!d.ok){ msg(d.message || 'Failed to load.', 'err'); return; }
+        gpuConfigured = !!d.gpu_configured;
+        var html = d.vms.length
+          ? d.vms.map(rowHtml).join('')
+          : '<tr><td colspan="5">No VMs found.</td></tr>';
+        document.getElementById('vmm-body').innerHTML = html;
+      })
+      .fail(function(){ msg('Could not reach the VM API.', 'err'); });
+  };
+
+  function tokenNow(){
+    if (typeof csrf_token !== 'undefined' && csrf_token) return csrf_token;
+    var el = document.querySelector('input[name="csrf_token"]');
+    if (el && el.value) return el.value;
+    var meta = document.querySelector('meta[name="csrf_token"]');
+    if (meta && meta.content) return meta.content;
+    try { if (window.top && window.top.csrf_token) return window.top.csrf_token; } catch(e){}
+    return CSRF || '';
+  }
+
+  // Shared call: fetch a fresh token (jQuery GET — the path this server's proxy
+  // honours), then issue the request as a jQuery GET. cb gets the parsed JSON.
+  function apiCall(params, cb){
+    $.getJSON(API + '?action=token')
+      .done(function(t){
+        var token = (t && t.token) ? t.token : tokenNow();
+        $.ajax({ url: API, type: 'GET', data: $.extend({ csrf_token: token }, params), dataType: 'json', cache: false })
+          .done(function(r){ cb(r || { ok:false, message:'Empty response.' }); })
+          .fail(function(x){ cb({ ok:false, message:(x.responseJSON && x.responseJSON.message) || ('Action failed (HTTP ' + x.status + ').') }); });
+      })
+      .fail(function(x){ cb({ ok:false, message:'Token fetch failed (HTTP ' + x.status + ').' }); });
+  }
+
+  // Poll the async memory-change status (running-VM restart cycle) until done.
+  function pollMem(vm, tries){
+    if (tries > 40) return;     // ~2 min ceiling
+    $.getJSON(API + '?action=memstatus&vm=' + encodeURIComponent(vm))
+      .done(function(d){
+        if (d && d.ok && d.status && d.status.done){
+          msg(d.status.message, d.status.ok ? 'ok' : 'err');
+          vmmLoad();
+        } else {
+          setTimeout(function(){ pollMem(vm, tries + 1); }, 3000);
+        }
+      })
+      .fail(function(){ setTimeout(function(){ pollMem(vm, tries + 1); }, 3000); });
+  }
+
+  function doAction(el, vm, action, extra){
+    el.disabled = true;
+    apiCall($.extend({ action: action, vm: vm }, extra || {}), function(r){
+      msg(r.message, r.ok ? 'ok' : 'err');
+      if (r.ok && r.async) pollMem(vm, 0);   // running-VM RAM change → watch for the outcome
+      setTimeout(vmmLoad, 800);
+    });
+  }
+
+  // --- GPU setup ------------------------------------------------------------
+  function loadGpuCfg(){
+    $.getJSON(API + '?action=gpucfg').done(function(d){
+      if (!d || !d.ok) return;
+      var opts = '<option value="">— none (GPU toggle disabled) —</option>';
+      (d.gpus || []).forEach(function(g){
+        opts += '<option value="' + esc(g.id) + '"' + (g.id === d.cfg.gpu_host ? ' selected' : '') + '>' +
+                esc(g.id) + ' — ' + esc(g.desc) + (g.has_audio ? ' (+audio)' : '') + '</option>';
+      });
+      document.getElementById('vmm-gpu-host').innerHTML = opts;
+      document.getElementById('vmm-guest-bus').value  = d.cfg.guest_bus || '';
+      document.getElementById('vmm-guest-slot').value = d.cfg.guest_slot || '';
+      document.getElementById('vmm-gpu-current').textContent =
+        d.cfg.configured ? ('Current: ' + d.cfg.gpu_host + (d.cfg.has_audio ? ' (VGA + audio)' : ' (VGA only)'))
+                         : 'Not configured — GPU toggle is disabled.';
+    });
+  }
+
+  function saveGpuCfg(){
+    apiCall({
+      action:     'savegpu',
+      gpu_host:   document.getElementById('vmm-gpu-host').value,
+      guest_bus:  document.getElementById('vmm-guest-bus').value.trim(),
+      guest_slot: document.getElementById('vmm-guest-slot').value.trim()
+    }, function(r){
+      msg(r.message, r.ok ? 'ok' : 'err');
+      loadGpuCfg();
+      vmmLoad();
+    });
+  }
+
+  // --- wire up --------------------------------------------------------------
+  $(function(){
+    $('#vmm-body')
+      .on('focus', 'input.ram', function(){ editing = true; })
+      .on('blur',  'input.ram', function(){ editing = false; })
+      .on('click', 'button[data-action]', function(){
+        var b = this, vm = b.dataset.vm, action = b.dataset.action;
+        var c = b.dataset.confirm;
+        if (c && !confirm(c)) return;
+        var extra = {};
+        if (action === 'gpu') extra.mode = b.dataset.mode || 'toggle';
+        if (action === 'mem'){
+          var input = b.parentNode.querySelector('input.ram');
+          var size  = input ? input.value.trim() : '';
+          if (!size){ msg('Enter a size, e.g. 8G.', 'err'); return; }
+          editing = false;
+          extra.size = size;
+        }
+        doAction(b, vm, action, extra);
+      });
+
+    document.getElementById('vmm-gpu-save').addEventListener('click', saveGpuCfg);
+
+    vmmLoad();
+    loadGpuCfg();
+    setInterval(vmmLoad, 5000);
+  });
+})();
+</script>
