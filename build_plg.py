@@ -6,7 +6,7 @@ HERE  = os.path.dirname(os.path.abspath(__file__))
 SRC   = os.path.join(HERE, "src")
 OUT   = os.path.join(HERE, "vm.manager.plg")
 AUTH   = "douglasak"
-VER    = "2026.06.08"
+VER    = "2026.10.24"
 GH_USER = "douglasak"
 GH_REPO = "vm-manager"
 BRANCH  = "main"   # change to "master" if your repo's default branch is master
@@ -47,6 +47,11 @@ parts.append(f"""<?xml version='1.0' standalone='yes'?>
 
 <CHANGES>
 ###&version;
+- If /etc/libvirt/qemu is a git repo, RAM and GPU changes commit the VM's
+  XML and push it to the repo's upstream (in the background; errors go to
+  syslog). Disable with "git_commit": false / "git_push": false in the cfg.
+
+###2026.06.08
 - Add pluginURL (GitHub) for update checks, support URL, and CA metadata.
 
 ###2026.06.07

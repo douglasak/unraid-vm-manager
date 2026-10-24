@@ -146,7 +146,8 @@ function vm_all(): array {
 // exists for this card.
 
 function cfg_load(): array {
-    $defaults = ['gpu_host' => '', 'guest_bus' => '0x06', 'guest_slot' => '0x00', 'has_audio' => true];
+    $defaults = ['gpu_host' => '', 'guest_bus' => '0x06', 'guest_slot' => '0x00', 'has_audio' => true,
+                 'git_commit' => true, 'git_push' => true];
     $raw = @file_get_contents(CFG_FILE);
     if ($raw === false || $raw === '') {
         $o = []; @exec('cat ' . escapeshellarg(CFG_FILE) . ' 2>/dev/null', $o);
@@ -235,6 +236,51 @@ function detect_gpus(): array {
     return $gpus;
 }
 
+// --- git versioning of VM XML -----------------------------------------------
+// If /etc/libvirt/qemu is a git repo, each --config change commits that VM's
+// <name>.xml (only that path) and pushes to its upstream. php-fpm clears the
+// environment, so HOME is set for root's ssh key/known_hosts; the author is
+// taken from the repo config, else from the latest commit. Runs in the
+// background under a lock; failures go to syslog (tag vm.manager).
+
+const QEMU_DIR = '/etc/libvirt/qemu';
+
+function git_enabled(): bool {
+    return is_dir(QEMU_DIR . '/.git') && !empty(cfg_load()['git_commit']);
+}
+
+/** Bash that commits (and optionally pushes) <vm>.xml, or '' if disabled. */
+function git_sync_script(string $vm, string $msg): string {
+    if (!git_enabled()) return '';
+    $tpl = <<<'BASH'
+export HOME=/root GIT_SSH_COMMAND='ssh -o BatchMode=yes -o UpdateHostKeys=no -o ConnectTimeout=15'
+cd %1$s || exit 0
+log() { logger -t vm.manager "git: $*"; }
+(
+  flock -w 60 9 || { log "lock timeout"; exit 0; }
+  f=%2$s
+  [ -f "$f" ] || { log "$f not found"; exit 0; }
+  git add -- "$f"
+  git diff --cached --quiet -- "$f" && exit 0
+  n=$(git config user.name  || git log -1 --format=%%an 2>/dev/null)
+  e=$(git config user.email || git log -1 --format=%%ae 2>/dev/null)
+  out=$(git -c user.name="${n:-vm.manager}" -c user.email="${e:-vm.manager@$(hostname)}" \
+        commit -q -m %3$s -- "$f" 2>&1) || { log "commit failed: $out"; exit 0; }
+  if [ %4$d = 1 ]; then
+    out=$(timeout 60 git push -q 2>&1) || log "push failed: $out"
+  fi
+) 9>/tmp/vm.manager.git.lock
+BASH;
+    return sprintf($tpl, escapeshellarg(QEMU_DIR), escapeshellarg("$vm.xml"),
+                   escapeshellarg("vm.manager: $msg"), !empty(cfg_load()['git_push']) ? 1 : 0);
+}
+
+/** Fire-and-forget commit/push after a synchronous config change. */
+function git_sync(string $vm, string $msg): void {
+    $script = git_sync_script($vm, $msg);
+    if ($script !== '') exec('nohup bash -c ' . escapeshellarg($script) . ' >/dev/null 2>&1 &');
+}
+
 // --- actions ----------------------------------------------------------------
 
 function ok(string $msg, array $extra = []): array  { return ['ok' => true,  'message' => $msg] + $extra; }
@@ -317,8 +363,12 @@ if [ -z "$err" ]; then
 else
   printf 'ts=%%s\nok=0\nmsg=%%s\n' "$(date +%%s)" "Memory change failed: $(printf %%s "$err" | tr '\n' ' ' | cut -c1-180)" > %5$s
 fi
+[ -z "$err" ] && (
+%6$s
+)
 BASH;
-        $script = sprintf($tpl, escapeshellarg(virsh_bin()), escapeshellarg($vm), $kib, $human, escapeshellarg($status));
+        $git    = git_sync_script($vm, "set memory of '$vm' to $human") ?: ':';
+        $script = sprintf($tpl, escapeshellarg(virsh_bin()), escapeshellarg($vm), $kib, $human, escapeshellarg($status), $git);
         exec('nohup bash -c ' . escapeshellarg($script) . ' >/dev/null 2>&1 &');
         return ok("Restarting '$vm' to apply $human…", ['async' => true]);
     }
@@ -326,6 +376,7 @@ BASH;
     [$rc1, $o1] = virsh(['setmaxmem', $vm, $kib, '--config']);
     [$rc2, $o2] = virsh(['setmem',    $vm, $kib, '--config']);
     if ($rc1 !== 0 || $rc2 !== 0) return fail(trim(implode("\n", array_merge($o1, $o2))));
+    git_sync($vm, "set memory of '$vm' to $human");
     return ok("Memory of '$vm' set to $human.");
 }
 
@@ -369,5 +420,6 @@ function act_gpu(string $vm, string $want = 'toggle'): array {
     if ($audFile) @unlink($audFile);
 
     if ($err) return fail(trim(implode("\n", $err)));
+    git_sync($vm, ($want === 'on' ? 'enable' : 'disable') . " GPU passthrough for '$vm'");
     return ok($msg, ['gpu' => $want]);
 }

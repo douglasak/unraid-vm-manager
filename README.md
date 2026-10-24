@@ -4,7 +4,7 @@ A small PHP/web interface to manage libvirt VMs on Unraid: start, stop, restart,
 force-stop, force-restart, set RAM, and toggle GPU passthrough — from an
 auto-refreshing table that mirrors Unraid's native styling.
 
-Release: **2026.06.08** · License: **MIT** · Repo: **github.com/douglasak/vm-manager**
+Release: **2026.10.24** · License: **MIT** · Repo: **github.com/douglasak/vm-manager**
 
 > **Use at your own risk.** This plugin controls virtual machines directly via
 > `virsh` — including force-stop, reset, RAM changes, and attaching/detaching
@@ -80,6 +80,25 @@ status, and refreshes every 5 seconds.
   audio) hostdevs with `--config`. It does **not** touch the VNC `<graphics>`
   block, so VNC remains defined; start the VM afterward to use the new display
   path.
+
+## Versioning VM XML in git (optional)
+
+If `/etc/libvirt/qemu` is a git repository, every RAM or GPU change made from
+the plugin commits that VM's `<name>.xml` (only that file) and pushes it to the
+repo's upstream. This runs in the background, so the page never waits on the
+network.
+
+- **Author:** the repo's `user.name` / `user.email` if set, otherwise the
+  author of the latest commit.
+- **Auth:** pushes run as root with `HOME=/root`, so root's SSH key
+  (`/root/.ssh`) must be authorised on the remote. Pushes are non-interactive
+  and give up after a timeout.
+- **Failures** (commit errors, rejected or timed-out pushes) are logged to
+  syslog under the tag `vm.manager`. A rejected push leaves the commit in place
+  locally; pull and push manually to reconcile.
+- **Turn off** by setting `"git_commit": false` (no commits) or
+  `"git_push": false` (commit locally only) in
+  `/boot/config/plugins/vm.manager/vm.manager.cfg`.
 
 ## GPU passthrough setup
 
