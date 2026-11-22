@@ -4,7 +4,7 @@ A small PHP/web interface to manage libvirt VMs on Unraid: start, stop, restart,
 force-stop, force-restart, set RAM, and toggle GPU passthrough — from an
 auto-refreshing table that mirrors Unraid's native styling.
 
-Release: **2026.10.24** · License: **MIT** · Repo: **github.com/douglasak/vm-manager**
+Release: **2026.10.24** · License: **MIT** · Repo: **github.com/douglasak/unraid-vm-manager**
 
 > **Use at your own risk.** This plugin controls virtual machines directly via
 > `virsh` — including force-stop, reset, RAM changes, and attaching/detaching
@@ -26,7 +26,7 @@ action handlers); `include/api.php` is a small JSON endpoint the page calls; and
 **From URL (recommended):** Unraid GUI → **Plugins → Install Plugin**, paste:
 
 ```
-https://raw.githubusercontent.com/douglasak/vm-manager/main/vm.manager.plg
+https://raw.githubusercontent.com/douglasak/unraid-vm-manager/main/vm.manager.plg
 ```
 
 and click Install. Installing this way registers the `pluginURL`, so Unraid will
@@ -166,7 +166,7 @@ The `.plg` is generated from the files under `src/`:
 
 ## Repository & updates
 
-Canonical home: <https://github.com/douglasak/vm-manager>. The built
+Canonical home: <https://github.com/douglasak/unraid-vm-manager>. The built
 `vm.manager.plg` lives at the repo root, and its `pluginURL` points at the raw
 file on the `main` branch, so Unraid checks there for updates. To publish a new
 version: edit `src/`, bump `VER` in `build_plg.py`, run `python3 build_plg.py`,

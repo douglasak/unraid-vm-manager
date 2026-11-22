@@ -3,8 +3,8 @@
 <!ENTITY name      "vm.manager">
 <!ENTITY author    "douglasak">
 <!ENTITY version   "2026.10.24">
-<!ENTITY pluginURL "https://raw.githubusercontent.com/douglasak/vm-manager/main/vm.manager.plg">
-<!ENTITY support   "https://github.com/douglasak/vm-manager/issues">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/douglasak/unraid-vm-manager/main/vm.manager.plg">
+<!ENTITY support   "https://github.com/douglasak/unraid-vm-manager/issues">
 <!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
 ]>
 
